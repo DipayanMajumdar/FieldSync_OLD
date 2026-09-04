@@ -3,303 +3,1876 @@ const multer = require('multer');
 const fs = require('fs');
 const path = require('path');
 const axios = require('axios');
-const FormData = require('form-data');
-const db = require('./db');
 const csv = require('csv-parser');
-const router = express.Router();
+const db = require('./db');
+
+const rt = express.Router();
+
+const p = db;
+const ax = axios;
+
+// =====================================================
+// MULTER CONFIGURATION
+// =====================================================
 
 const uploadDir = path.join(__dirname, 'uploads');
+
 if (!fs.existsSync(uploadDir)) {
-    fs.mkdirSync(uploadDir, { recursive: true });
+  fs.mkdirSync(uploadDir, { recursive: true });
 }
 
 const storage = multer.diskStorage({
-    destination: (req, file, cb) => cb(null, uploadDir),
-    filename: (req, file, cb) => {
-        const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
-        cb(null, uniqueSuffix + '-' + file.originalname.replace(/[^a-zA-Z0-9.]/g, '_'));
-    }
+  destination: (req, file, cb) => {
+    cb(null, uploadDir);
+  },
+
+  filename: (req, file, cb) => {
+    const uniqueName =
+      Date.now() +
+      '-' +
+      Math.round(Math.random() * 1e9) +
+      path.extname(file.originalname);
+
+    cb(null, uniqueName);
+  }
 });
-const upload = multer({ storage });
 
-// Recursive WBS upward rollup engine (L6 -> L1)
-async function recalculateRollup(nodeId) {
-    let currentId = nodeId;
+const up = multer({
+  storage
+});
 
-    while (currentId) {
-        const parentRes = await db.query('SELECT parent_id FROM wbs_nodes WHERE id = $1', [currentId]);
-        const parentId = parentRes.rows[0]?.parent_id;
+// =====================================================
+// PROJECTS
+// =====================================================
 
-        if (!parentId) break;
+rt.get('/projects', async (q, rs) => {
+  try {
+    const d = await p.query(`
+      SELECT
+        id,
+        tnt,
+        nm,
+        st
+      FROM prj
+      ORDER BY id
+    `);
 
-        // Weighted aggregation: sum(child_progress * child_weight) / sum(child_weight)
-        const rollupRes = await db.query(`
-            SELECT 
-                COALESCE(SUM(progress * weight) / NULLIF(SUM(weight), 0), 0) AS calculated_progress
-            FROM wbs_nodes 
-            WHERE parent_id = $1
-        `, [parentId]);
+    rs.json(d.rows);
 
-        const newProg = parseFloat(rollupRes.rows[0].calculated_progress).toFixed(1);
+  } catch (e) {
+    console.error('PROJECTS ERR:', e.message);
 
-        await db.query(`
-            UPDATE wbs_nodes 
-            SET progress = $1, 
-                status = CASE WHEN $1 < planned_progress - 5 THEN 'BEHIND' ELSE 'ON_TRACK' END,
-                updated_at = CURRENT_TIMESTAMP 
-            WHERE id = $2
-        `, [newProg, parentId]);
+    rs.status(500).json({
+      err: 'Failed to fetch projects',
+      message: e.message
+    });
+  }
+});
 
-        currentId = parentId;
+// =====================================================
+// PROJECT WBS
+// =====================================================
+
+rt.get('/prj/:id/wbs', async (q, rs) => {
+  try {
+    const d = await p.query(`
+      SELECT
+        w.id AS wbs_id,
+        w.pid,
+        w.cd AS wbs_code,
+        w.nm AS wbs_name,
+        w.lvl,
+
+        a.id AS activity_id,
+        a.plan_qty,
+        a.act_qty,
+        a.unt
+
+      FROM wbs w
+
+      LEFT JOIN act a
+        ON a.wid = w.id
+
+      WHERE w.pid = $1
+
+      ORDER BY
+        w.lvl,
+        w.id,
+        a.id
+    `, [q.params.id]);
+
+    rs.json(d.rows);
+
+  } catch (e) {
+    console.error('WBS ERR:', e.message);
+
+    rs.status(500).json({
+      err: 'Failed to fetch WBS data',
+      message: e.message
+    });
+  }
+});
+
+// =====================================================
+// ACTIVITY DETAILS
+// =====================================================
+
+rt.get('/activity/:id', async (q, rs) => {
+  try {
+    const d = await p.query(`
+      SELECT
+        a.id AS activity_id,
+        a.wid,
+        a.plan_qty,
+        a.act_qty,
+        a.unt,
+
+        w.id AS wbs_id,
+        w.cd AS wbs_code,
+        w.nm AS wbs_name,
+        w.lvl,
+        w.pid
+
+      FROM act a
+
+      JOIN wbs w
+        ON a.wid = w.id
+
+      WHERE a.id = $1
+    `, [q.params.id]);
+
+    if (!d.rows.length) {
+      return rs.status(404).json({
+        err: 'Activity not found'
+      });
     }
-}
 
-// 1. Sync Field Entry (Receives payload -> Calls AI Worker -> Updates DB -> Triggers Rollup)
-router.post('/sync', upload.fields([{ name: 'image' }, { name: 'audio' }]), async (req, res) => {
-    const { wbs_id, progress, quantity, unit, lat, lng } = req.body;
-    const imageFile = req.files && req.files['image'] ? req.files['image'][0] : null;
-    const audioFile = req.files && req.files['audio'] ? req.files['audio'][0] : null;
+    const activity = d.rows[0];
 
-    let aiTags = [];
-    let transcript = "No voice remark provided.";
+    const planned =
+      Number(activity.plan_qty || 0);
 
-    // Call Python FastAPI AI Worker if files exist
-    try {
-        if (imageFile || audioFile) {
-            const formData = new FormData();
-            if (imageFile) {
-                formData.append('image', fs.createReadStream(imageFile.path), imageFile.filename);
-            }
-            if (audioFile) {
-                formData.append('audio', fs.createReadStream(audioFile.path), audioFile.filename);
-            }
+    const actual =
+      Number(activity.act_qty || 0);
 
-            const aiResponse = await axios.post('http://localhost:8000/analyze', formData, {
-                headers: formData.getHeaders(),
-                timeout: 10000
-            });
+    const progress =
+      planned > 0
+        ? Math.min(
+            100,
+            Number(
+              ((actual / planned) * 100).toFixed(2)
+            )
+          )
+        : 0;
 
-            if (aiResponse.data) {
-                aiTags = aiResponse.data.vision_analysis || [];
-                transcript = aiResponse.data.voice_transcript || transcript;
-            }
+    let status = 'Pending';
+
+    if (progress >= 100) {
+      status = 'Completed';
+    } else if (progress >= 70) {
+      status = 'In Progress';
+    } else if (progress >= 40) {
+      status = 'At Risk';
+    } else if (progress > 0) {
+      status = 'Delayed';
+    }
+
+    rs.json({
+      activity_id: activity.activity_id,
+      wbs_id: activity.wbs_id,
+      wbs_code: activity.wbs_code,
+      activity_name: activity.wbs_name,
+      level: activity.lvl,
+      project_id: activity.pid,
+
+      planned_qty: planned,
+      actual_qty: actual,
+
+      unit: activity.unt || '%',
+
+      progress,
+      status
+    });
+
+  } catch (e) {
+    console.error('ACTIVITY ERR:', e.message);
+
+    rs.status(500).json({
+      err: 'Failed to fetch activity',
+      message: e.message
+    });
+  }
+});
+
+// =====================================================
+// GET EVIDENCE
+// =====================================================
+
+rt.get('/evidence/:pid', async (q, rs) => {
+  const pid = q.params.pid;
+
+  try {
+    const d = await p.query(`
+      SELECT
+
+        e.id AS evidence_id,
+        e.pid AS activity_id,
+        e.loc,
+        e.uri,
+        e.ai_result,
+        e.ai_confidence,
+        e.review_status,
+        e.review_reason,
+        e.reviewed_by,
+        e.reviewed_at,
+        e.created_at,
+
+        a.id AS act_id,
+        a.plan_qty,
+        a.act_qty,
+        a.unt,
+
+        w.id AS wbs_id,
+        w.cd AS wbs_code,
+        w.nm AS activity_name,
+        w.pid AS project_id
+
+      FROM evd e
+
+      LEFT JOIN act a
+        ON e.pid = a.id
+
+      LEFT JOIN wbs w
+        ON a.wid = w.id
+
+      WHERE w.pid = $1
+
+      ORDER BY
+        e.created_at DESC,
+        e.id DESC
+    `, [pid]);
+
+    const evidence = d.rows.map((item) => {
+
+      let latitude = null;
+      let longitude = null;
+
+      // -----------------------------------------
+      // GPS PARSING
+      // -----------------------------------------
+
+      if (item.loc) {
+        const parts =
+          String(item.loc)
+            .split(',')
+            .map((x) => x.trim());
+
+        if (parts.length === 2) {
+          const parsedLat = Number(parts[0]);
+          const parsedLng = Number(parts[1]);
+
+          if (
+            Number.isFinite(parsedLat) &&
+            Number.isFinite(parsedLng)
+          ) {
+            latitude = parsedLat;
+            longitude = parsedLng;
+          }
         }
-    } catch (aiErr) {
-        console.warn('AI worker offline or timeout. Defaulting to field data:', aiErr.message);
-    }
+      }
+
+      return {
+        evidence_id: item.evidence_id,
+
+        activity_id: item.activity_id,
+
+        wbs_id: item.wbs_id,
+
+        wbs_code: item.wbs_code,
+
+        activity_name: item.activity_name,
+
+        // ---------------------------------------
+        // IMAGE URL
+        // ---------------------------------------
+
+        uri:
+          item.uri
+            ? `/uploads/${path.basename(item.uri)}`
+            : null,
+
+        // ---------------------------------------
+        // GPS
+        // ---------------------------------------
+
+        loc: item.loc || null,
+
+        latitude,
+        longitude,
+
+        // ---------------------------------------
+        // QUANTITY
+        // ---------------------------------------
+
+        plan_qty:
+          Number(item.plan_qty || 0),
+
+        actual_qty:
+          Number(item.act_qty || 0),
+
+        unit:
+          item.unt || '%',
+
+        // ---------------------------------------
+        // AI
+        // ---------------------------------------
+
+        ai_result:
+          item.ai_result || null,
+
+        ai_confidence:
+          Number(item.ai_confidence || 0),
+
+        // ---------------------------------------
+        // REVIEW
+        // ---------------------------------------
+
+        review_status:
+          item.review_status ||
+          'Pending Review',
+
+        review_reason:
+          item.review_reason || null,
+
+        reviewed_by:
+          item.reviewed_by || null,
+
+        reviewed_at:
+          item.reviewed_at || null,
+
+        created_at:
+          item.created_at || null
+      };
+    });
+
+    rs.json({
+      project_id: Number(pid),
+      total: evidence.length,
+      evidence
+    });
+
+  } catch (e) {
+    console.error('EVIDENCE GET ERR:', e);
+
+    rs.status(500).json({
+      err: 'Failed to fetch evidence',
+      message: e.message
+    });
+  }
+});
+
+// =====================================================
+// UPLOAD FIELD EVIDENCE
+// =====================================================
+
+rt.post(
+  '/evd',
+  up.single('file'),
+  async (q, rs) => {
+
+    const {
+      id,
+      w,
+      t,
+      lat,
+      lng
+    } = q.body;
+
+    // -----------------------------------------
+    // GPS
+    // -----------------------------------------
+
+    const latitude =
+      lat !== undefined && lat !== ''
+        ? Number(lat)
+        : null;
+
+    const longitude =
+      lng !== undefined && lng !== ''
+        ? Number(lng)
+        : null;
+
+    // -----------------------------------------
+    // STORE GPS IN loc
+    // -----------------------------------------
+
+    const location =
+      latitude !== null &&
+      longitude !== null &&
+      Number.isFinite(latitude) &&
+      Number.isFinite(longitude)
+        ? `${latitude},${longitude}`
+        : null;
+
+    // -----------------------------------------
+    // FILE PATH
+    // -----------------------------------------
+
+    const u =
+      q.file
+        ? path.resolve(q.file.path)
+        : q.body.u;
 
     try {
-        // Save entry
-        const entryInsert = await db.query(`
-            INSERT INTO entries (wbs_id, progress, quantity, unit, lat, lng, image_path, audio_path, transcript, ai_tags, status)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'SYNCED')
-            RETURNING *;
-        `, [
-            wbs_id, progress, quantity, unit || 'Units',
-            lat || 27.47, lng || 95.02,
-            imageFile ? imageFile.filename : null,
-            audioFile ? audioFile.filename : null,
-            transcript, JSON.stringify(aiTags)
-        ]);
 
-        // Update target leaf activity
-        await db.query(`
-            UPDATE wbs_nodes 
-            SET progress = $1, 
-                status = CASE WHEN $1 < planned_progress - 5 THEN 'BEHIND' ELSE 'ON_TRACK' END,
-                updated_at = CURRENT_TIMESTAMP
-            WHERE id = $2
-        `, [progress, wbs_id]);
+      // -----------------------------------------
+      // REQUIRED ACTIVITY CHECK
+      // -----------------------------------------
 
-        // Execute upward rollup to root
-        await recalculateRollup(wbs_id);
-
-        res.status(200).json({
-            success: true,
-            entry: entryInsert.rows[0],
-            ai: { tags: aiTags, transcript }
+      if (!id) {
+        return rs.status(400).json({
+          err: 'Activity ID is required'
         });
-    } catch (err) {
-        console.error('Error during sync processing:', err);
-        res.status(500).json({ success: false, error: err.message });
-    }
-});
+      }
 
-// 2. Project Executive Overview
-router.get('/stats', async (req, res) => {
-    try {
-        const rootRes = await db.query("SELECT * FROM wbs_nodes WHERE level = 1 LIMIT 1");
-        const root = rootRes.rows[0] || { progress: 68.4, planned_progress: 74.0 };
+      // -----------------------------------------
+      // FILE CHECK
+      // -----------------------------------------
 
-        const disciplines = await db.query(`
-            SELECT discipline, ROUND(AVG(progress)::numeric, 1) as progress
-            FROM wbs_nodes 
-            WHERE level >= 4 AND discipline != 'Project Management'
-            GROUP BY discipline
-        `);
-
-        const alertsCount = await db.query("SELECT COUNT(*) FROM delay_alerts");
-        const entriesCount = await db.query("SELECT COUNT(*) FROM entries WHERE created_at >= CURRENT_DATE");
-
-        res.json({
-            overall_progress: root.progress,
-            planned_baseline: root.planned_progress,
-            variance: (root.progress - root.planned_progress).toFixed(1),
-            open_alerts: parseInt(alertsCount.rows[0].count, 10),
-            synced_today: parseInt(entriesCount.rows[0].count, 10),
-            disciplines: disciplines.rows
+      if (!q.file && !q.body.u) {
+        return rs.status(400).json({
+          err: 'Evidence file is required'
         });
-    } catch (err) {
-        res.status(500).json({ error: err.message });
+      }
+
+      // -----------------------------------------
+      // SEND TO AI WORKER
+      // -----------------------------------------
+
+      const ai = await ax.post(
+        'http://127.0.0.1:8000/analyze',
+        {
+          id: parseInt(id),
+          uri: u,
+          typ: t
+        }
+      );
+
+      const aiResult =
+        ai.data?.sts ||
+        'AI analysis completed';
+
+      const aiConfidence =
+        Number(
+          ai.data?.confidence || 90
+        );
+
+      // -----------------------------------------
+      // SAVE EVIDENCE
+      // -----------------------------------------
+
+      const ev = await p.query(`
+        INSERT INTO evd
+        (
+          pid,
+          loc,
+          uri,
+          ai_result,
+          ai_confidence,
+          review_status,
+          created_at
+        )
+
+        VALUES
+        (
+          $1,
+          $2,
+          $3,
+          $4,
+          $5,
+          $6,
+          CURRENT_TIMESTAMP
+        )
+
+        RETURNING
+          id,
+          pid,
+          loc,
+          uri,
+          ai_result,
+          ai_confidence,
+          review_status,
+          created_at
+      `, [
+        parseInt(id),
+        location,
+        u,
+        aiResult,
+        aiConfidence,
+        'Pending Review'
+      ]);
+
+      // -----------------------------------------
+      // RESPONSE
+      // -----------------------------------------
+
+      rs.json({
+        st: 'Evidence uploaded successfully',
+
+        db: ev.rows[0],
+
+        ai: {
+          result: aiResult,
+          confidence: aiConfidence
+        },
+
+        gps: {
+          latitude,
+          longitude,
+          location
+        },
+
+        image_url:
+          `/uploads/${path.basename(u)}`
+      });
+
+    } catch (e) {
+
+      console.error(
+        'EVIDENCE UPLOAD ERR:',
+        e
+      );
+
+      rs.status(500).json({
+        err: 'Failed to upload evidence',
+        message: e.message
+      });
     }
+  }
+);
+
+// =====================================================
+// BRG
+// =====================================================
+
+rt.post('/brg', async (q, rs) => {
+
+  const {
+    wid,
+    pp
+  } = q.body;
+
+  try {
+
+    const t = await p.query(
+      'SELECT * FROM act WHERE wid = $1',
+      [wid]
+    );
+
+    if (!t.rows.length) {
+      return rs.status(404).json({
+        err: 'not found'
+      });
+    }
+
+    const b =
+      Number(t.rows[0].act_qty || 0);
+
+    const d =
+      Number(pp) - b;
+
+    const s = await p.query(
+      `INSERT INTO aud
+       (
+         uid,
+         act,
+         bfr,
+         aft
+       )
+       VALUES
+       (
+         $1,
+         $2,
+         $3,
+         $4
+       )
+       RETURNING id`,
+      [
+        'sys',
+        'ai_sg',
+        b,
+        pp
+      ]
+    );
+
+    rs.json({
+      dev: d,
+      sug: s.rows[0].id
+    });
+
+  } catch (e) {
+
+    console.error(
+      'BRG ERR:',
+      e.message
+    );
+
+    rs.status(500).json({
+      err: 1
+    });
+  }
 });
 
-// 3. WBS Tree Endpoint
-router.get('/wbs', async (req, res) => {
-    try {
-        const nodes = await db.query('SELECT * FROM wbs_nodes ORDER BY level ASC, code ASC');
-        res.json(nodes.rows);
-    } catch (err) {
-        res.status(500).json({ error: err.message });
+// =====================================================
+// APPROVE EVIDENCE
+// =====================================================
+
+rt.post('/approve', async (q, rs) => {
+
+  const {
+    activity_id,
+    evidence_id,
+    actual_qty
+  } = q.body;
+
+  try {
+
+    // -----------------------------------------
+    // REQUIRED FIELD CHECK
+    // -----------------------------------------
+
+    if (
+      !activity_id ||
+      !evidence_id ||
+      actual_qty === undefined
+    ) {
+      return rs.status(400).json({
+        err:
+          'activity_id, evidence_id and actual_qty are required'
+      });
     }
+
+    // -----------------------------------------
+    // CHECK ACTIVITY
+    // -----------------------------------------
+
+    const activity = await p.query(
+      `SELECT
+         id,
+         act_qty
+       FROM act
+       WHERE id = $1`,
+      [activity_id]
+    );
+
+    if (!activity.rows.length) {
+      return rs.status(404).json({
+        err: 'Activity not found'
+      });
+    }
+
+    // -----------------------------------------
+    // CHECK EXACT EVIDENCE
+    // -----------------------------------------
+
+    const evidence = await p.query(
+      `SELECT
+         id,
+         pid,
+         review_status
+       FROM evd
+       WHERE id = $1
+         AND pid = $2`,
+      [
+        evidence_id,
+        activity_id
+      ]
+    );
+
+    if (!evidence.rows.length) {
+      return rs.status(404).json({
+        err:
+          'Evidence not found for this activity'
+      });
+    }
+
+    const before =
+      Number(
+        activity.rows[0].act_qty || 0
+      );
+
+    const after =
+      Number(actual_qty);
+
+    if (!Number.isFinite(after)) {
+      return rs.status(400).json({
+        err: 'actual_qty must be a valid number'
+      });
+    }
+
+    // -----------------------------------------
+    // UPDATE ACTIVITY
+    // -----------------------------------------
+
+    await p.query(
+      `UPDATE act
+       SET act_qty = $1
+       WHERE id = $2`,
+      [
+        after,
+        activity_id
+      ]
+    );
+
+    // -----------------------------------------
+    // UPDATE EXACT EVIDENCE
+    // -----------------------------------------
+
+    await p.query(
+      `UPDATE evd
+       SET
+         review_status = 'Approved',
+         review_reason = NULL,
+         reviewed_by = 'sys_manager',
+         reviewed_at = CURRENT_TIMESTAMP
+       WHERE id = $1`,
+      [evidence_id]
+    );
+
+    // -----------------------------------------
+    // AUDIT LOG
+    // -----------------------------------------
+
+    await p.query(
+      `INSERT INTO aud
+       (
+         uid,
+         act,
+         bfr,
+         aft
+       )
+       VALUES
+       (
+         $1,
+         $2,
+         $3,
+         $4
+       )`,
+      [
+        'sys_manager',
+        'progress_update',
+        before,
+        after
+      ]
+    );
+
+    // -----------------------------------------
+    // RESPONSE
+    // -----------------------------------------
+
+    rs.json({
+      st:
+        'Progress successfully updated',
+
+      activity_id:
+        Number(activity_id),
+
+      evidence_id:
+        Number(evidence_id),
+
+      before,
+      after,
+
+      review_status:
+        'Approved'
+    });
+
+  } catch (e) {
+
+    console.error(
+      'APPROVE ERR:',
+      e
+    );
+
+    rs.status(500).json({
+      err:
+        'Failed to update progress',
+
+      message:
+        e.message
+    });
+  }
 });
 
-// 4. Live Entries & HITL Queue Endpoint
-router.get('/entries', async (req, res) => {
-    try {
-        const entries = await db.query(`
-            SELECT e.*, w.name as task_name, w.code as task_code, w.discipline
-            FROM entries e
-            JOIN wbs_nodes w ON e.wbs_id = w.id
-            ORDER BY e.created_at DESC
-        `);
-        res.json(entries.rows);
-    } catch (err) {
-        res.status(500).json({ error: err.message });
+// =====================================================
+// REJECT EVIDENCE
+// =====================================================
+
+rt.post('/reject', async (q, rs) => {
+
+  const {
+    activity_id,
+    evidence_id,
+    reason
+  } = q.body;
+
+  try {
+
+    // -----------------------------------------
+    // REQUIRED FIELD CHECK
+    // -----------------------------------------
+
+    if (
+      !activity_id ||
+      !evidence_id
+    ) {
+      return rs.status(400).json({
+        err:
+          'activity_id and evidence_id are required'
+      });
     }
+
+    // -----------------------------------------
+    // CHECK ACTIVITY
+    // -----------------------------------------
+
+    const activity = await p.query(
+      `SELECT
+         id,
+         act_qty
+       FROM act
+       WHERE id = $1`,
+      [activity_id]
+    );
+
+    if (!activity.rows.length) {
+      return rs.status(404).json({
+        err: 'Activity not found'
+      });
+    }
+
+    // -----------------------------------------
+    // CHECK EXACT EVIDENCE
+    // -----------------------------------------
+
+    const evidence = await p.query(
+      `SELECT
+         id,
+         pid,
+         review_status
+       FROM evd
+       WHERE id = $1
+         AND pid = $2`,
+      [
+        evidence_id,
+        activity_id
+      ]
+    );
+
+    if (!evidence.rows.length) {
+      return rs.status(404).json({
+        err:
+          'Evidence not found for this activity'
+      });
+    }
+
+    const currentQty =
+      Number(
+        activity.rows[0].act_qty || 0
+      );
+
+    const rejectReason =
+      reason ||
+      'Evidence rejected';
+
+    // -----------------------------------------
+    // UPDATE EXACT EVIDENCE
+    // -----------------------------------------
+
+    const updatedEvidence =
+      await p.query(
+        `UPDATE evd
+         SET
+           review_status = 'Rejected',
+           review_reason = $1,
+           reviewed_by = 'sys_manager',
+           reviewed_at = CURRENT_TIMESTAMP
+         WHERE id = $2
+         RETURNING
+           id,
+           pid,
+           review_status,
+           review_reason,
+           reviewed_by,
+           reviewed_at`,
+        [
+          rejectReason,
+          evidence_id
+        ]
+      );
+
+    // -----------------------------------------
+    // AUDIT LOG
+    // -----------------------------------------
+
+    await p.query(
+      `INSERT INTO aud
+       (
+         uid,
+         act,
+         bfr,
+         aft
+       )
+       VALUES
+       (
+         $1,
+         $2,
+         $3,
+         $4
+       )`,
+      [
+        'sys_manager',
+        'evidence_rejected',
+        currentQty,
+        currentQty
+      ]
+    );
+
+    // -----------------------------------------
+    // RESPONSE
+    // -----------------------------------------
+
+    rs.json({
+      st:
+        'Evidence rejected successfully',
+
+      activity_id:
+        Number(activity_id),
+
+      evidence_id:
+        Number(evidence_id),
+
+      reason:
+        rejectReason,
+
+      evidence:
+        updatedEvidence.rows[0] || null
+    });
+
+  } catch (e) {
+
+    console.error(
+      'REJECT ERR:',
+      e
+    );
+
+    rs.status(500).json({
+      err:
+        'Failed to reject evidence',
+
+      message:
+        e.message
+    });
+  }
 });
 
-// 5. Active Delay Alerts Endpoint
-router.get('/alerts', async (req, res) => {
-    try {
-        const alerts = await db.query('SELECT * FROM delay_alerts ORDER BY created_at DESC');
-        res.json(alerts.rows);
-    } catch (err) {
-        res.status(500).json({ error: err.message });
+// =====================================================
+// SCHEDULE CSV UPLOAD
+// =====================================================
+
+rt.post(
+  '/schedule/upload',
+  up.single('file'),
+  async (q, rs) => {
+
+    const tasks = [];
+
+    const pid =
+      q.body.pid || 1;
+
+    // -----------------------------------------
+    // CHECK FILE
+    // -----------------------------------------
+
+    if (!q.file) {
+      return rs.status(400).json({
+        err: 'CSV file is required'
+      });
     }
+
+    // -----------------------------------------
+    // PARSE CSV
+    // -----------------------------------------
+
+    fs.createReadStream(q.file.path)
+      .pipe(csv())
+
+      .on('data', (row) => {
+        tasks.push(row);
+      })
+
+      .on('end', async () => {
+
+        try {
+
+          // -----------------------------------
+          // INSERT EACH CSV TASK
+          // -----------------------------------
+
+          for (const t of tasks) {
+
+            // -------------------------------
+            // INSERT WBS
+            // -------------------------------
+
+            const wbs =
+              await p.query(
+                `INSERT INTO wbs
+                 (
+                   pid,
+                   cd,
+                   nm
+                 )
+                 VALUES
+                 (
+                   $1,
+                   $2,
+                   $3
+                 )
+                 RETURNING id`,
+                [
+                  pid,
+                  t.wbs_code,
+                  t.wbs_name
+                ]
+              );
+
+            // -------------------------------
+            // INSERT ACTIVITY
+            // -------------------------------
+
+            await p.query(
+              `INSERT INTO act
+               (
+                 wid,
+                 plan_qty,
+                 act_qty,
+                 unt
+               )
+               VALUES
+               (
+                 $1,
+                 $2,
+                 $3,
+                 $4
+               )`,
+              [
+                wbs.rows[0].id,
+
+                Number(
+                  t.planned_qty || 100
+                ),
+
+                Number(
+                  t.actual_qty || 0
+                ),
+
+                t.unit || 'pct'
+              ]
+            );
+          }
+
+          // -----------------------------------
+          // RESPONSE
+          // -----------------------------------
+
+          rs.json({
+            st:
+              `Successfully imported ${tasks.length} WBS tasks into PostgreSQL.`
+          });
+
+        } catch (e) {
+
+          console.error(
+            'INGESTION ERR:',
+            e.message
+          );
+
+          rs.status(500).json({
+            err:
+              'Database insertion failed',
+
+            message:
+              e.message
+          });
+        }
+      });
+  }
+);
+
+// =====================================================
+// DELAY ALERTS
+// =====================================================
+
+rt.get('/delay-alerts/:pid', async (q, rs) => {
+
+  const pid =
+    q.params.pid;
+
+  try {
+
+    const d = await p.query(`
+      SELECT
+
+        a.id AS activity_id,
+
+        a.plan_qty,
+        a.act_qty,
+        a.unt,
+
+        w.id AS wbs_id,
+        w.cd AS wbs_code,
+        w.nm AS activity_name,
+        w.pid,
+        w.lvl
+
+      FROM act a
+
+      JOIN wbs w
+        ON a.wid = w.id
+
+      WHERE w.pid = $1
+
+      ORDER BY
+        a.id
+    `, [pid]);
+
+    const alerts =
+      d.rows
+        .map((item) => {
+
+          const planned =
+            Number(
+              item.plan_qty || 0
+            );
+
+          const actual =
+            Number(
+              item.act_qty || 0
+            );
+
+          const progress =
+            planned > 0
+              ? Number(
+                  Math.min(
+                    100,
+                    (actual / planned) * 100
+                  ).toFixed(2)
+                )
+              : 0;
+
+          let status = null;
+
+          if (progress === 0) {
+            status = 'Delayed';
+          } else if (progress < 40) {
+            status = 'Delayed';
+          } else if (progress < 70) {
+            status = 'At Risk';
+          }
+
+          if (!status) {
+            return null;
+          }
+
+          return {
+            activity_id:
+              item.activity_id,
+
+            wbs_id:
+              item.wbs_id,
+
+            wbs_code:
+              item.wbs_code,
+
+            activity_name:
+              item.activity_name,
+
+            planned_qty:
+              planned,
+
+            actual_qty:
+              actual,
+
+            progress,
+
+            status,
+
+            unit:
+              item.unt || '%'
+          };
+        })
+        .filter(Boolean);
+
+    rs.json({
+      project_id:
+        Number(pid),
+
+      total_alerts:
+        alerts.length,
+
+      delayed_count:
+        alerts.filter(
+          (x) =>
+            x.status === 'Delayed'
+        ).length,
+
+      at_risk_count:
+        alerts.filter(
+          (x) =>
+            x.status === 'At Risk'
+        ).length,
+
+      alerts
+    });
+
+  } catch (e) {
+
+    console.error(
+      'DELAY ALERTS ERR:',
+      e.message
+    );
+
+    rs.status(500).json({
+      err:
+        'Failed to fetch delay alerts',
+
+      message:
+        e.message
+    });
+  }
 });
 
+// =====================================================
+// DASHBOARD
+// =====================================================
 
-// 9. Admin Sync Health & Conflicts Endpoint
-router.get('/admin/sync-health', async (req, res) => {
-    try {
-        const conflictsRes = await db.query('SELECT * FROM sync_conflicts ORDER BY created_at DESC');
-        const devicesRes = await db.query('SELECT COUNT(*) FROM entries WHERE created_at >= NOW() - INTERVAL \'24 hours\'');
-        
-        res.json({
-            devices_online: 47,
-            pending_sync: 8,
-            conflicts_count: conflictsRes.rows.filter(c => c.status === 'UNRESOLVED').length,
-            sync_success_rate: 94,
-            conflicts: conflictsRes.rows
-        });
-    } catch (err) {
-        res.status(500).json({ error: err.message });
+rt.get('/dashboard/:pid', async (q, rs) => {
+
+  const pid =
+    Number(q.params.pid);
+
+  try {
+
+    // =================================================
+    // 1. PROJECT INFORMATION
+    // =================================================
+
+    const projectRes =
+      await p.query(`
+        SELECT
+          id,
+          tnt,
+          nm,
+          st
+        FROM prj
+        WHERE id = $1
+      `, [pid]);
+
+    if (!projectRes.rows.length) {
+      return rs.status(404).json({
+        err:
+          'Project not found'
+      });
     }
+
+    const project =
+      projectRes.rows[0];
+
+    // =================================================
+    // 2. ACTIVITY STATISTICS
+    // =================================================
+
+    const progressRes =
+      await p.query(`
+        SELECT
+
+          COUNT(a.id)
+            AS total_activities,
+
+          COUNT(
+            CASE
+              WHEN
+                a.plan_qty > 0
+                AND a.act_qty >= a.plan_qty
+              THEN 1
+            END
+          )
+            AS completed_activities,
+
+          COUNT(
+            CASE
+              WHEN
+                COALESCE(a.act_qty, 0) = 0
+              THEN 1
+            END
+          )
+            AS pending_activities,
+
+          COALESCE(
+            SUM(a.plan_qty),
+            0
+          )
+            AS total_planned_qty,
+
+          COALESCE(
+            SUM(a.act_qty),
+            0
+          )
+            AS total_actual_qty
+
+        FROM act a
+
+        JOIN wbs w
+          ON a.wid = w.id
+
+        WHERE w.pid = $1
+      `, [pid]);
+
+    const stats =
+      progressRes.rows[0];
+
+    const totalActivities =
+      Number(
+        stats.total_activities || 0
+      );
+
+    const completedActivities =
+      Number(
+        stats.completed_activities || 0
+      );
+
+    const pendingActivities =
+      Number(
+        stats.pending_activities || 0
+      );
+
+    const plannedQty =
+      Number(
+        stats.total_planned_qty || 0
+      );
+
+    const actualQty =
+      Number(
+        stats.total_actual_qty || 0
+      );
+
+    // =================================================
+    // 3. OVERALL PROGRESS
+    // =================================================
+
+    const overallProgress =
+      plannedQty > 0
+        ? Number(
+            Math.min(
+              100,
+              (actualQty / plannedQty) * 100
+            ).toFixed(2)
+          )
+        : 0;
+
+    // =================================================
+    // 4. EVIDENCE STATISTICS
+    // =================================================
+
+    const evidenceStatsRes =
+      await p.query(`
+        SELECT
+
+          COUNT(e.id)
+            AS evidence_count,
+
+          COUNT(
+            CASE
+              WHEN
+                e.review_status =
+                'Approved'
+              THEN 1
+            END
+          )
+            AS approved_evidence,
+
+          COUNT(
+            CASE
+              WHEN
+                e.review_status =
+                'Rejected'
+              THEN 1
+            END
+          )
+            AS rejected_evidence,
+
+          COUNT(
+            CASE
+              WHEN
+                e.review_status IS NULL
+                OR
+                e.review_status =
+                'Pending Review'
+              THEN 1
+            END
+          )
+            AS pending_evidence
+
+        FROM evd e
+
+        JOIN act a
+          ON e.pid = a.id
+
+        JOIN wbs w
+          ON a.wid = w.id
+
+        WHERE w.pid = $1
+      `, [pid]);
+
+    const evidenceStats =
+      evidenceStatsRes.rows[0];
+
+    const evidenceCount =
+      Number(
+        evidenceStats.evidence_count || 0
+      );
+
+    const approvedEvidence =
+      Number(
+        evidenceStats.approved_evidence || 0
+      );
+
+    const rejectedEvidence =
+      Number(
+        evidenceStats.rejected_evidence || 0
+      );
+
+    const pendingEvidence =
+      Number(
+        evidenceStats.pending_evidence || 0
+      );
+
+    // =================================================
+    // 5. ACTIVITY-WISE PROGRESS
+    // =================================================
+
+    const activityRes =
+      await p.query(`
+        SELECT
+
+          a.id AS activity_id,
+
+          w.id AS wbs_id,
+
+          w.cd AS wbs_code,
+
+          w.nm AS activity_name,
+
+          a.plan_qty,
+
+          a.act_qty,
+
+          a.unt
+
+        FROM act a
+
+        JOIN wbs w
+          ON a.wid = w.id
+
+        WHERE w.pid = $1
+
+        ORDER BY
+          w.lvl,
+          w.id,
+          a.id
+      `, [pid]);
+
+    const activities =
+      activityRes.rows.map(
+        (item) => {
+
+          const plan =
+            Number(
+              item.plan_qty || 0
+            );
+
+          const actual =
+            Number(
+              item.act_qty || 0
+            );
+
+          const progress =
+            plan > 0
+              ? Number(
+                  Math.min(
+                    100,
+                    (actual / plan) * 100
+                  ).toFixed(2)
+                )
+              : 0;
+
+          let status =
+            'Pending';
+
+          if (progress >= 100) {
+            status =
+              'Completed';
+
+          } else if (progress >= 70) {
+            status =
+              'In Progress';
+
+          } else if (progress >= 40) {
+            status =
+              'At Risk';
+
+          } else if (progress > 0) {
+            status =
+              'Delayed';
+          }
+
+          return {
+            activity_id:
+              item.activity_id,
+
+            wbs_id:
+              item.wbs_id,
+
+            wbs_code:
+              item.wbs_code,
+
+            activity_name:
+              item.activity_name,
+
+            planned_qty:
+              plan,
+
+            actual_qty:
+              actual,
+
+            progress,
+
+            status,
+
+            unit:
+              item.unt || '%'
+          };
+        }
+      );
+
+    // =================================================
+    // 6. DELAY / RISK
+    // =================================================
+
+    const delayedActivities =
+      activities.filter(
+        (x) =>
+          x.status === 'Delayed'
+      );
+
+    const atRiskActivities =
+      activities.filter(
+        (x) =>
+          x.status === 'At Risk'
+      );
+
+    // =================================================
+    // 7. RECENT EVIDENCE
+    // =================================================
+
+    const recentEvidenceRes =
+      await p.query(`
+        SELECT
+
+          e.id AS evidence_id,
+
+          e.pid AS activity_id,
+
+          e.loc,
+
+          e.uri,
+
+          e.ai_result,
+
+          e.ai_confidence,
+
+          e.review_status,
+
+          e.review_reason,
+
+          e.reviewed_by,
+
+          e.reviewed_at,
+
+          e.created_at,
+
+          w.cd AS wbs_code,
+
+          w.nm AS activity_name
+
+        FROM evd e
+
+        JOIN act a
+          ON e.pid = a.id
+
+        JOIN wbs w
+          ON a.wid = w.id
+
+        WHERE w.pid = $1
+
+        ORDER BY
+          e.created_at DESC,
+          e.id DESC
+
+        LIMIT 10
+      `, [pid]);
+
+    const recentEvidence =
+      recentEvidenceRes.rows.map(
+        (item) => {
+
+          let latitude = null;
+          let longitude = null;
+
+          // -----------------------------------------
+          // GPS PARSING
+          // -----------------------------------------
+
+          if (item.loc) {
+
+            const parts =
+              String(item.loc)
+                .split(',')
+                .map((x) => x.trim());
+
+            if (parts.length === 2) {
+
+              const parsedLat =
+                Number(parts[0]);
+
+              const parsedLng =
+                Number(parts[1]);
+
+              if (
+                Number.isFinite(parsedLat) &&
+                Number.isFinite(parsedLng)
+              ) {
+
+                latitude =
+                  parsedLat;
+
+                longitude =
+                  parsedLng;
+              }
+            }
+          }
+
+          return {
+
+            evidence_id:
+              item.evidence_id,
+
+            activity_id:
+              item.activity_id,
+
+            wbs_code:
+              item.wbs_code,
+
+            activity_name:
+              item.activity_name,
+
+            uri:
+              item.uri
+                ? `/uploads/${path.basename(item.uri)}`
+                : null,
+
+            loc:
+              item.loc || null,
+
+            latitude,
+            longitude,
+
+            ai_result:
+              item.ai_result || null,
+
+            ai_confidence:
+              Number(
+                item.ai_confidence || 0
+              ),
+
+            review_status:
+              item.review_status ||
+              'Pending Review',
+
+            review_reason:
+              item.review_reason || null,
+
+            reviewed_by:
+              item.reviewed_by || null,
+
+            reviewed_at:
+              item.reviewed_at || null,
+
+            created_at:
+              item.created_at || null
+          };
+        }
+      );
+
+    // =================================================
+    // 8. RECENT AUDIT ACTIVITY
+    // =================================================
+
+    const auditRes =
+      await p.query(`
+        SELECT
+
+          id,
+          uid,
+          act,
+          bfr,
+          aft
+
+        FROM aud
+
+        ORDER BY
+          id DESC
+
+        LIMIT 10
+      `);
+
+    // =================================================
+    // 9. FINAL DASHBOARD RESPONSE
+    // =================================================
+
+    rs.json({
+
+      // -----------------------------
+      // PROJECT
+      // -----------------------------
+
+      project_id:
+        pid,
+
+      project: {
+
+        id:
+          project.id,
+
+        code:
+          project.tnt,
+
+        name:
+          project.nm,
+
+        status:
+          project.st
+      },
+
+      // -----------------------------
+      // PROGRESS
+      // -----------------------------
+
+      overall_progress_pct:
+        overallProgress,
+
+      total_planned_qty:
+        plannedQty,
+
+      total_actual_qty:
+        actualQty,
+
+      // -----------------------------
+      // ACTIVITIES
+      // -----------------------------
+
+      total_activities:
+        totalActivities,
+
+      completed_activities:
+        completedActivities,
+
+      pending_activities:
+        pendingActivities,
+
+      // -----------------------------
+      // EVIDENCE
+      // -----------------------------
+
+      evidence_count:
+        evidenceCount,
+
+      approved_evidence:
+        approvedEvidence,
+
+      rejected_evidence:
+        rejectedEvidence,
+
+      pending_evidence:
+        pendingEvidence,
+
+      // -----------------------------
+      // DELAYS
+      // -----------------------------
+
+      total_delayed:
+        delayedActivities.length,
+
+      total_at_risk:
+        atRiskActivities.length,
+
+      alerts: [
+        ...delayedActivities,
+        ...atRiskActivities
+      ],
+
+      // -----------------------------
+      // ACTIVITIES
+      // -----------------------------
+
+      activities,
+
+      // -----------------------------
+      // RECENT EVIDENCE
+      // -----------------------------
+
+      recent_evidence:
+        recentEvidence,
+
+      // -----------------------------
+      // AUDIT
+      // -----------------------------
+
+      recent_audit:
+        auditRes.rows
+    });
+
+  } catch (e) {
+
+    console.error(
+      'DASHBOARD ERR:',
+      e
+    );
+
+    rs.status(500).json({
+
+      err:
+        'Dashboard generation failed',
+
+      message:
+        e.message
+    });
+  }
 });
 
-// Resolve Conflict Action Endpoint
-router.post('/admin/resolve-conflict', async (req, res) => {
-    const { conflict_id, resolution } = req.body; // resolution: 'MOBILE', 'MANUAL', or 'UNRESOLVED'
-    try {
-        await db.query(`
-            UPDATE sync_conflicts 
-            SET status = 'RESOLVED_' || $1 
-            WHERE id = $2
-        `, [resolution, conflict_id]);
-        res.json({ success: true, message: `Conflict resolved using ${resolution} data source.` });
-    } catch (err) {
-        res.status(500).json({ success: false, error: err.message });
-    }
-});
+// =====================================================
+// EXPORT ROUTER
+// =====================================================
 
-// 10. Admin Conflicts Endpoint
-router.get('/admin/conflicts-list', async (req, res) => {
-    try {
-        const result = await db.query('SELECT * FROM sync_conflicts ORDER BY created_at DESC');
-        res.json(result.rows);
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
-});
-
-// 11. Admin Devices Endpoint
-router.get('/admin/devices', async (req, res) => {
-    try {
-        res.json([
-            { id: 1, device_name: "iPhone 14 — Field Unit Alpha", role: "Site Engineer", status: "Online", last_sync: "2 mins ago", ip: "192.168.1.45" },
-            { id: 2, device_name: "iPad Pro — Inspector Beta", role: "HSE Inspector", status: "Online", last_sync: "5 mins ago", ip: "192.168.1.52" },
-            { id: 3, device_name: "Rugged Tab — Field Gamma", role: "Site Engineer", status: "Offline", last_sync: "3 hours ago", ip: "192.168.2.11" },
-        ]);
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
-});
-
-// 12. Admin Users Endpoint
-router.get('/admin/users', async (req, res) => {
-    try {
-        res.json([
-            { id: 1, name: "System Administrator", role: "Admin", access: "Full Control", status: "Active" },
-            { id: 2, name: "Project Manager Control", role: "Project Manager", access: "Sector 7B", status: "Active" },
-            { id: 3, name: "Lead Field Engineer", role: "Site Engineer", access: "Area C3", status: "Active" },
-        ]);
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
-});
-
-// 13. Admin Audit Logs Endpoint
-
-router.get('/admin/audit-logs', async (req, res) => {
-    try {
-        const logs = await db.query(`
-            SELECT e.id, w.name as activity, e.status, e.created_at
-            FROM entries e
-            JOIN wbs_nodes w ON e.wbs_id = w.id
-            ORDER BY e.created_at DESC LIMIT 20
-        `);
-        res.json(logs.rows);
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
-});
-
-// 14. Engineer Submissions & Sync Queue Endpoint
-router.get('/engineer/submissions', async (req, res) => {
-    try {
-        const result = await db.query(`
-            SELECT e.*, w.name as task_name, w.code as task_code, w.discipline
-            FROM entries e
-            JOIN wbs_nodes w ON e.wbs_id = w.id
-            ORDER BY e.created_at DESC
-        `);
-        res.json(result.rows);
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
-});
-
-// 15. Engineer Projects Endpoint
-router.get('/engineer/projects', async (req, res) => {
-    try {
-        const result = await db.query(`
-            SELECT * FROM wbs_nodes WHERE level = 1
-        `);
-        res.json(result.rows);
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
-});
-
-module.exports = router;
+module.exports = rt;
