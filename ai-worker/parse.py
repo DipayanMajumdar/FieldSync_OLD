@@ -1,21 +1,29 @@
-from xerparser import Xer
-import psycopg2
+CONSTRUCTION_MAP = {
+    "person": ("Site Worker", "HSE / Labor Verification"),
+    "truck": ("Material Hauler", "Heavy Logistics"),
+    "car": ("Inspection Vehicle", "Logistics"),
+    "fire hydrant": ("Emergency Safety Point", "HSE Asset"),
+    "backpack": ("Field Diagnostic Toolbag", "Equipment"),
+    "bottle": ("Hydration Resource", "HSE Welfare")
+}
 
-def ing(f_p):
-    x = Xer(f_p)
-    c = psycopg2.connect(dbname="execution_bridge", user="sih_admin", password="sih_password", host="localhost")
-    cr = c.cursor()
-    p = list(x.projects.values())[0]
-    
-    cr.execute("INSERT INTO prj (nm) VALUES (%s) RETURNING id", (p.name,))
-    pid = cr.fetchone()[0]
-    
-    for w in p.wbs_nodes:
-        cr.execute("INSERT INTO wbs (pid, cd, nm) VALUES (%s, %s, %s)", (pid, w.wbs_code, w.wbs_name))
-    
-    for t in p.tasks:
-        cr.execute("INSERT INTO act (wid, qty, unt) VALUES (%s, %s, %s)", (pid, 0, "pct"))
-        
-    c.commit()
-    cr.close()
-    c.close()
+def parse_yolo_results(results):
+    detected = []
+    for r in results:
+        for box in r.boxes:
+            cls_id = int(box.cls[0])
+            name = r.names[cls_id]
+            conf = round(float(box.conf[0]) * 100, 1)
+
+            mapped_term, discipline = CONSTRUCTION_MAP.get(name, (name.title(), "General Worksite"))
+            detected.append({
+                "raw_label": name,
+                "label": mapped_term,
+                "category": discipline,
+                "confidence": conf
+            })
+    return detected
+
+def parse_whisper_transcript(text):
+    clean = text.strip()
+    return clean if clean else "No clear speech detected."

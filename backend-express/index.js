@@ -1,16 +1,17 @@
-const exp = require('express');
-const crs = require('cors');
-const apiRoutes = require('./routes'); // Imports your routes.js file
+require('dotenv').config();
+const express = require('express');
+const cors = require('cors');
+const path = require('path');
+const routes = require('./routes');
 
-const app = exp();
-app.use(crs());
-app.use(exp.json());
+const app = express();
+app.use(cors());
+app.use(express.json());
 
-// Mount the routes to the /api path
-app.use('/api', apiRoutes);
+// Crucial: Exposes the uploads folder so Next.js can render the images
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
-app.get('/health', (q, rs) => {
-  rs.json({ st: 'ok' });
-});
+app.use('/api', routes);
 
-app.listen(3000, '0.0.0.0', () => console.log('Node Express Server running on Port 3000'));
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, '0.0.0.0', () => console.log(`Backend running on port ${PORT}`));

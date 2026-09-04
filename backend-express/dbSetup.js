@@ -1,67 +1,85 @@
-const { Pool } = require('pg');
-require('dotenv').config();
+const path = require('path');
+require('dotenv').config({ path: path.join(__dirname, '.env') });
+const db = require('./db');
 
-const p = new Pool({
-  user: process.env.DB_U,
-  host: process.env.DB_H,
-  database: process.env.DB_N,
-  password: process.env.DB_P,
-  port: process.env.DB_PT,
-});
+const init = async () => {
+    try {
+        await db.query(`
+            DROP TABLE IF EXISTS entries, delay_alerts, reports, documents, wbs_nodes CASCADE;
 
-const s = `
-DROP TABLE IF EXISTS aud, evd, act, wbs, prj CASCADE;
+            CREATE TABLE wbs_nodes (
+                id SERIAL PRIMARY KEY,
+                code VARCHAR(50) UNIQUE NOT NULL,
+                level INT NOT NULL,
+                parent_id INT REFERENCES wbs_nodes(id) ON DELETE CASCADE,
+                name VARCHAR(255) NOT NULL,
+                discipline VARCHAR(100) NOT NULL,
+                weight FLOAT NOT NULL DEFAULT 1.0,
+                planned_progress FLOAT NOT NULL DEFAULT 0.0,
+                progress FLOAT NOT NULL DEFAULT 0.0,
+                status VARCHAR(50) DEFAULT 'ON_TRACK',
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
 
-CREATE TABLE prj (
-  id SERIAL PRIMARY KEY,
-  tnt VARCHAR(50),
-  nm VARCHAR(100),
-  st VARCHAR(100)
-);
+            CREATE TABLE entries (
+                id SERIAL PRIMARY KEY,
+                wbs_id INT REFERENCES wbs_nodes(id) ON DELETE CASCADE,
+                progress FLOAT NOT NULL,
+                quantity FLOAT NOT NULL,
+                unit VARCHAR(50),
+                lat FLOAT,
+                lng FLOAT,
+                image_path VARCHAR(255),
+                audio_path VARCHAR(255),
+                transcript TEXT,
+                ai_tags JSONB DEFAULT '[]',
+                status VARCHAR(50) DEFAULT 'SYNCED',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
 
-CREATE TABLE wbs (
-  id SERIAL PRIMARY KEY,
-  pid INT REFERENCES prj(id),
-  prnt_id INT REFERENCES wbs(id), -- Links L6 to L5, L5 to L4, etc.
-  lvl INT,                        -- Stores the WBS level (1-6)
-  cd VARCHAR(50),
-  nm VARCHAR(100)
-);
+            CREATE TABLE delay_alerts (
+                id SERIAL PRIMARY KEY,
+                wbs_id INT REFERENCES wbs_nodes(id) ON DELETE CASCADE,
+                discipline VARCHAR(100),
+                title VARCHAR(255) NOT NULL,
+                details VARCHAR(255),
+                severity VARCHAR(20) DEFAULT 'MEDIUM',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
 
-CREATE TABLE act (
-  id SERIAL PRIMARY KEY,
-  wid INT REFERENCES wbs(id),
-  plan_qty DECIMAL,               -- Baseline quantity
-  act_qty DECIMAL DEFAULT 0,      -- Actual completed quantity
-  unt VARCHAR(20)
-);
+            CREATE TABLE reports (
+                id SERIAL PRIMARY KEY,
+                title VARCHAR(255) NOT NULL,
+                report_type VARCHAR(50) NOT NULL,
+                file_size VARCHAR(50),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
 
-CREATE TABLE evd (
-  id SERIAL PRIMARY KEY,
-  pid INT REFERENCES prj(id),
-  loc VARCHAR(255),               
-  uri TEXT,
-  ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
+            CREATE TABLE documents (
+                id SERIAL PRIMARY KEY,
+                name VARCHAR(255) NOT NULL,
+                category VARCHAR(100) NOT NULL,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
 
-CREATE TABLE aud (
-  id SERIAL PRIMARY KEY,
-  uid VARCHAR(50),
-  act VARCHAR(50),
-  bfr DECIMAL,
-  aft DECIMAL,
-  ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-`;
-
-const bld = async () => {
-  try {
-    await p.query(s);
-    console.log('db ok');
-  } catch (e) {
-    console.log(e);
-  } finally {
-    p.end();
-  }
+            CREATE TABLE IF NOT EXISTS sync_conflicts (
+                id SERIAL PRIMARY KEY,
+                task_code VARCHAR(50) NOT NULL,
+                title VARCHAR(255) NOT NULL,
+                conflict_type VARCHAR(50) NOT NULL, -- e.g. 'FAILED_UPLOAD', 'PROGRESS_CONFLICT', 'LOCATION_MISMATCH'
+                mobile_value VARCHAR(100),
+                manual_value VARCHAR(100),
+                details TEXT,
+                status VARCHAR(50) DEFAULT 'UNRESOLVED',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        `);
+        console.log('PostgreSQL: Schema setup complete.');
+        process.exit(0);
+    } catch (err) {
+        console.error('Database setup error:', err);
+        process.exit(1);
+    }
 };
-bld();
+
+init();

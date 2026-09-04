@@ -1,113 +1,133 @@
-'use client';
-import { useState, useEffect, FormEvent } from 'react';
-import { getWbs, sendEvd, apvUpdate } from '../services/api';
+"use client";
+import { useState } from "react";
+import { useRouter } from "next/navigation";
 
-type WbsItem = {
-  id: number;
-  cd: string;
-  nm: string;
-};
+export default function LoginPage() {
+  const router = useRouter();
+  const [role, setRole] = useState("Project Manager");
+  const [showRoleDropdown, setShowRoleDropdown] = useState(false);
+  const [employeeId, setEmployeeId] = useState("");
+  const [password, setPassword] = useState("");
 
-export default function Dashboard() {
-  const [wbs, setWbs] = useState<WbsItem[]>([]);
-  const [selWbs, setSelWbs] = useState('');
-  const [uri, setUri] = useState<File | string>(''); 
-  const [res, setRes] = useState<any>(null);
-  const [typ, setTyp] = useState('img');
-
-  useEffect(() => {
-    getWbs(1).then(setWbs).catch(console.error);
-  }, []);
-
-  const handleUpload = async (e: FormEvent) => {
+  const handleLogin = (e: React.FormEvent) => {
     e.preventDefault();
-    setRes('Processing AI...');
-    try {
-      const fd = new FormData();
-      fd.append('id', '1');
-      fd.append('w', selWbs);
-      fd.append('t', typ); // Fixed: Removed quotes around typ
-      if (typeof uri !== 'string') fd.append('file', uri); 
-      
-      const out = await sendEvd(fd); 
-      setRes(out);
-    } catch (err) {
-      setRes({ error: 'Error connecting to backend' });
-    }
-  };
-
-  const handleApprove = async () => {
-    if (!res || !res.db) return;
-    try {
-      // Assuming AI returns a progress percentage, hardcoding 100 for now
-      await apvUpdate({ aid: res.db.id, wid: parseInt(selWbs), pp: 100 });
-      setRes({ ...res, status: 'Officially Approved by Manager' });
-    } catch (err) {
-      alert('Approval failed');
-    }
+    if (role === "Project Manager") router.push("/manager");
+    else if (role === "Site Engineer") router.push("/engineer");
+    else if (role === "Admin") router.push("/admin");
   };
 
   return (
-    <div style={{ padding: '20px', fontFamily: 'sans-serif', backgroundColor: '#ffffff', color: '#000000', minHeight: '100vh' }}>
-      <h1>Execution Bridge Dashboard</h1>
-      
-      <section style={{ marginBottom: '20px' }}>
-        <h2>1. Active WBS Tasks</h2>
-        <ul>
-          {wbs.map((w) => (
-            <li key={w.id}>[{w.cd}] - {w.nm}</li>
-          ))}
-        </ul>
-      </section>
-
-      <section style={{ marginBottom: '20px' }}>
-        <h2>2. Capture Site Evidence</h2>
-        <form onSubmit={handleUpload}>
-          <label>Select WBS: </label>
-          <select value={selWbs} onChange={(e) => setSelWbs(e.target.value)} required style={{ color: '#000', padding: '5px' }}>
-            <option value="">-- Choose Task --</option>
-            {wbs.map((w) => (
-              <option key={w.id} value={w.id.toString()}>{w.nm}</option>
-            ))}
-          </select>
-          <br /><br />
-          
-          {/* NEW: Evidence Type Dropdown */}
-          <label>Evidence Type: </label>
-          <select value={typ} onChange={(e) => setTyp(e.target.value)} style={{ color: '#000', padding: '5px', marginBottom: '10px' }}>
-            <option value="img">Site Photo</option>
-            <option value="aud">Voice Report</option>
-          </select>
-          <br /><br />
-
-          <label>Upload File: </label>
-          <input 
-            type="file" 
-            accept={typ === 'img' ? "image/*" : "audio/*"} // Dynamically accept images or audio
-            onChange={(e) => setUri(e.target.files ? e.target.files[0] : '')} 
-            style={{ color: '#000', marginBottom: '10px' }}
-            required
-          />
-          <br /><br />
-          <button type="submit" style={{ padding: '8px 16px', background: '#0056b3', color: '#ffffff', border: 'none', borderRadius: '4px', cursor: 'pointer' }}>
-            Run AI Observation
-          </button>
-        </form>
-      </section>
-
-      <section>
-        <h2>3. System Output & HITL Approval</h2>
-        <pre style={{ background: '#f4f4f4', color: '#333', padding: '15px', borderRadius: '5px', overflowX: 'auto', border: '1px solid #ddd' }}>
-          {typeof res === 'string' ? res : JSON.stringify(res, null, 2)}
-        </pre>
+    <div className="flex h-screen w-full font-sans overflow-hidden">
+      {/* Left Panel */}
+      <div className="hidden lg:flex flex-col justify-between w-5/12 bg-[#121412] text-white p-12 relative">
+        <div className="absolute top-0 right-0 w-96 h-96 bg-[#d66c25]/10 rounded-full blur-3xl -translate-y-1/2 translate-x-1/3 pointer-events-none"></div>
         
-        {/* NEW: Human-in-the-Loop Approval Button */}
-        {res && res.ai && !res.status && (
-          <button onClick={handleApprove} style={{ marginTop: '10px', padding: '8px 16px', background: '#28a745', color: '#ffffff', border: 'none', borderRadius: '4px', cursor: 'pointer' }}>
-            Approve AI Suggestion
-          </button>
-        )}
-      </section>
+        <div>
+          <h1 className="text-xl font-bold tracking-tight">
+            Field<span className="text-[#d66c25]">Sync</span>
+          </h1>
+          <p className="text-[9px] tracking-[0.25em] text-gray-500 mt-1 uppercase">Field Control</p>
+        </div>
+
+        <div className="max-w-md z-10 my-auto">
+          <h2 className="text-4xl xl:text-5xl font-semibold tracking-tight leading-[1.15] mb-6">
+            Smart field data,<br />connected projects.
+          </h2>
+          <p className="text-gray-400 text-xs xl:text-sm leading-relaxed mb-12">
+            Capture field data, verify evidence, and keep every project role synced — from site engineer to project control.
+          </p>
+
+          <div className="flex gap-12">
+            <div>
+              <p className="text-2xl font-bold">94%</p>
+              <p className="text-[11px] text-gray-500 mt-0.5">Sync success</p>
+            </div>
+            <div>
+              <p className="text-2xl font-bold">47</p>
+              <p className="text-[11px] text-gray-500 mt-0.5">Devices online</p>
+            </div>
+            <div>
+              <p className="text-2xl font-bold">3</p>
+              <p className="text-[11px] text-gray-500 mt-0.5">Active projects</p>
+            </div>
+          </div>
+        </div>
+
+        <div className="text-[10px] text-gray-500 border-t border-gray-800/80 pt-6 flex justify-between">
+          <span>© 2026 FieldSync</span>
+          <span>Secure access • Role-based permissions</span>
+        </div>
+      </div>
+
+      {/* Right Panel */}
+      <div className="flex-1 flex flex-col justify-center items-center bg-[#f5f4ef] p-8">
+        <div className="w-full max-w-sm">
+          <p className="text-[10px] font-bold tracking-widest text-gray-400 uppercase mb-2">Welcome Back</p>
+          <h2 className="text-2xl font-bold text-gray-900 mb-1.5 tracking-tight">Sign in to FieldSync</h2>
+          <p className="text-xs text-gray-500 mb-8">Enter your credentials to continue to your project workspace.</p>
+
+          <form onSubmit={handleLogin} className="space-y-4">
+            <div>
+              <label className="block text-[11px] font-bold text-gray-700 mb-1.5 uppercase tracking-wider">Employee ID</label>
+              <input 
+                type="text" 
+                value={employeeId}
+                onChange={(e) => setEmployeeId(e.target.value)}
+                placeholder="e.g. FS-2291" 
+                className="w-full bg-white border border-gray-200/80 rounded-lg px-4 py-3 text-xs focus:outline-none focus:border-[#d66c25] focus:ring-1 focus:ring-[#d66c25] transition shadow-2xs"
+              />
+            </div>
+
+            <div>
+              <label className="block text-[11px] font-bold text-gray-700 mb-1.5 uppercase tracking-wider">Password</label>
+              <div className="relative">
+                <input 
+                  type="password" 
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  placeholder="Enter password" 
+                  className="w-full bg-white border border-gray-200/80 rounded-lg px-4 py-3 text-xs focus:outline-none focus:border-[#d66c25] focus:ring-1 focus:ring-[#d66c25] transition shadow-2xs"
+                />
+                <button type="button" className="absolute right-4 top-1/2 -translate-y-1/2 text-[10px] font-bold text-gray-400 hover:text-gray-600">SHOW</button>
+              </div>
+            </div>
+
+            <div className="relative">
+              <label className="block text-[11px] font-bold text-gray-700 mb-1.5 uppercase tracking-wider">Login as</label>
+              <div 
+                className="w-full bg-white border border-gray-200/80 rounded-lg px-4 py-3 text-xs flex justify-between items-center cursor-pointer shadow-2xs"
+                onClick={() => setShowRoleDropdown(!showRoleDropdown)}
+              >
+                <span className="text-gray-900 font-medium">{role}</span>
+                <span className="text-[9px] text-gray-500">▼</span>
+              </div>
+              
+              {showRoleDropdown && (
+                <div className="absolute w-full mt-1.5 bg-white border border-gray-200 rounded-lg shadow-xl z-20 overflow-hidden">
+                  {["Site Engineer", "Project Manager", "Admin"].map((r) => (
+                    <div 
+                      key={r} 
+                      className="px-4 py-3 text-xs text-gray-800 hover:bg-[#f5f4ef] cursor-pointer font-medium border-b border-gray-50 last:border-none"
+                      onClick={() => { setRole(r); setShowRoleDropdown(false); }}
+                    >
+                      {r}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            <button 
+              type="submit" 
+              className="w-full bg-[#d66c25] hover:bg-[#c25e1f] text-white font-semibold rounded-lg py-3.5 text-xs transition mt-2 shadow-sm"
+            >
+              Sign In
+            </button>
+          </form>
+          
+          <p className="text-center text-[10px] text-gray-400 mt-8">Secure access • Data encrypted in transit</p>
+        </div>
+      </div>
     </div>
   );
 }

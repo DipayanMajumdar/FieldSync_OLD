@@ -1,106 +1,300 @@
-import { useState } from 'react';
-import axios from 'axios';
+import React, { useState, useEffect, useRef } from "react";
+import axios from "axios";
+import "./App.css";
 
 export default function App() {
-  const [wbs, setWbs] = useState('4');
-  const [progress, setProgress] = useState('100');
-  const [file, setFile] = useState(null);
-  const [queueCount, setQueueCount] = useState(0);
+  const [tab, setTab] = useState("capture");
+  const [isOnline, setIsOnline] = useState(true);
+  const [tasks, setTasks] = useState([]);
+  const [selectedTaskId, setSelectedTaskId] = useState("");
+  const [progress, setProgress] = useState(50);
+  const [quantity, setQuantity] = useState("");
+  const [photo, setPhoto] = useState(null);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  
+  const [recording, setRecording] = useState(false);
+  const [audioBlob, setAudioBlob] = useState(null);
+  const [recordSeconds, setRecordSeconds] = useState(0);
+  const mediaRecorderRef = useRef(null);
+  const audioChunksRef = useRef([]);
+  const timerRef = useRef(null);
+
   const [queue, setQueue] = useState([]);
 
-  // 1. Standard HTML5 File/Camera Input
-  const handleFileChange = (e) => {
-    if (e.target.files.length > 0) {
-      setFile(e.target.files[0]);
+  useEffect(() => {
+    axios.get("http://localhost:3000/api/wbs")
+      .then((res) => {
+        const leafTasks = res.data.filter((t) => t.level >= 5);
+        setTasks(leafTasks);
+        if (leafTasks.length > 0) {
+          setSelectedTaskId(leafTasks[0].id);
+          setProgress(leafTasks[0].progress);
+        }
+      })
+      .catch(() => console.warn("Using offline task fallback"));
+
+    const saved = localStorage.getItem("fieldsync_queue");
+    if (saved) setQueue(JSON.parse(saved));
+  }, []);
+
+  const selectedTask = tasks.find((t) => t.id === parseInt(selectedTaskId)) || {
+    id: 7, code: "L5.14", name: "Spool Fabrication", discipline: "Piping", progress: 54, unit: "Joints"
+  };
+
+  const startRecording = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      mediaRecorderRef.current = new MediaRecorder(stream);
+      audioChunksRef.current = [];
+
+      mediaRecorderRef.current.ondataavailable = (e) => audioChunksRef.current.push(e.data);
+      mediaRecorderRef.current.onstop = () => {
+        const blob = new Blob(audioChunksRef.current, { type: "audio/ogg" });
+        setAudioBlob(blob);
+      };
+
+      mediaRecorderRef.current.start();
+      setRecording(true);
+      setRecordSeconds(0);
+      timerRef.current = setInterval(() => setRecordSeconds((s) => s + 1), 1000);
+    } catch (e) {
+      alert("Microphone access denied. Ensure browser permissions are allowed.");
     }
   };
 
-  // 2. Mock Offline Storage (In-Memory Array)
-  const saveOfflineMock = () => {
-    if (!file) return alert('Select an image or capture a photo first.');
-    
-    // Determine type based on standard MIME types
-    const isAudio = file.type.startsWith('audio');
-    const newItem = { wbs_id: wbs, progress, file, type: isAudio ? 'aud' : 'img' };
-    
-    setQueue([...queue, newItem]);
-    setQueueCount(queueCount + 1);
-    setFile(null); // Reset input
-    
-    // Reset file input UI
-    document.getElementById('media-upload').value = '';
-    alert('Saved to web queue!');
+  const stopRecording = () => {
+    if (mediaRecorderRef.current) {
+      mediaRecorderRef.current.stop();
+      mediaRecorderRef.current.stream.getTracks().forEach((track) => track.stop());
+    }
+    clearInterval(timerRef.current);
+    setRecording(false);
   };
 
-  // 3. Network Sync to Localhost
-  const syncData = async () => {
-    for (let item of queue) {
-      const fd = new FormData();
-      fd.append('id', '1'); // Master Project ID
-      fd.append('w', item.wbs_id);
-      fd.append('t', item.type);
-      
-      // Standard web File object appending
-      fd.append('file', item.file);
+  const syncItem = async (payload) => {
+    const fd = new FormData();
+    fd.append("wbs_id", payload.wbs_id);
+    fd.append("progress", payload.progress);
+    fd.append("quantity", payload.quantity);
+    fd.append("unit", payload.unit);
+    fd.append("lat", payload.lat);
+    fd.append("lng", payload.lng);
+    if (payload.imageFile) fd.append("image", payload.imageFile);
+    if (payload.audioBlob) fd.append("audio", payload.audioBlob, "remark.ogg");
 
+    return axios.post("http://localhost:3000/api/sync", fd);
+  };
+
+  useEffect(() => {
+    if (isOnline) {
+      const pending = queue.filter((i) => i.status === "QUEUED");
+      pending.forEach(async (item) => {
+        try {
+          await syncItem(item);
+          setQueue((prev) => {
+            const updated = prev.map((q) => q.id === item.id ? { ...q, status: "SYNCED" } : q);
+            localStorage.setItem("fieldsync_queue", JSON.stringify(updated));
+            return updated;
+          });
+        } catch (e) {
+          console.error("Auto-sync error", e);
+        }
+      });
+    }
+  }, [isOnline]);
+
+  const handleSave = async () => {
+    if (recording) {
+      alert("Please stop the voice recording before saving.");
+      return;
+    }
+    if (isSubmitting) return;
+    
+    setIsSubmitting(true);
+
+    const payload = {
+      id: Date.now(),
+      wbs_id: selectedTask.id,
+      code: selectedTask.code,
+      name: selectedTask.name,
+      progress: parseFloat(progress),
+      quantity: quantity || "1",
+      unit: selectedTask.unit || "Units",
+      lat: 27.4728,
+      lng: 95.0211,
+      imageFile: photo,
+      audioBlob: audioBlob,
+      timestamp: new Date().toLocaleTimeString(),
+      status: isOnline ? "SYNCED" : "QUEUED"
+    };
+
+    if (isOnline) {
       try {
-        // Because it is a web app on your PC, localhost works perfectly
-        await axios.post('http://localhost:3000/api/evd', fd, {
-          headers: { 'Content-Type': 'multipart/form-data' },
-        });
-      } catch (error) {
-        console.error('Sync failed:', error);
-        alert('Failed to connect to Express backend. Is it running?');
-        return;
+        await syncItem(payload);
+      } catch (err) {
+        payload.status = "QUEUED";
       }
     }
+
+    const updated = [payload, ...queue];
+    setQueue(updated);
+    localStorage.setItem("fieldsync_queue", JSON.stringify(updated));
     
-    alert('Sync Complete! Check your backend uploads folder.');
-    setQueue([]);
-    setQueueCount(0);
+    // Reset form state for the next capture
+    setQuantity("");
+    setPhoto(null);
+    setAudioBlob(null);
+    setRecordSeconds(0);
+    setIsSubmitting(false);
+    setTab("queue");
   };
 
   return (
-    <div style={{ maxWidth: '450px', margin: '40px auto', padding: '30px', fontFamily: 'system-ui, sans-serif', border: '1px solid #ccc', borderRadius: '10px', boxShadow: '0 4px 10px rgba(0,0,0,0.1)' }}>
-      <h2 style={{ textAlign: 'center', marginBottom: '30px' }}>FieldSync Web Mockup</h2>
+    <div className="mobile-frame">
+      <header className="app-header">
+        <div className="title-group">
+          <h2>{selectedTask.code} — {selectedTask.name}</h2>
+          <p>{selectedTask.discipline} • Area C3 • Sector 7B</p>
+        </div>
+        <div
+          className={`status-badge ${isOnline ? "online" : "offline"}`}
+          onClick={() => setIsOnline(!isOnline)}
+        >
+          {isOnline ? "● ONLINE" : "● OFFLINE • QUEUED"}
+        </div>
+      </header>
 
-      <label style={{ fontWeight: 'bold' }}>WBS ID (e.g., 4 for Concrete):</label>
-      <input 
-        value={wbs} 
-        onChange={(e) => setWbs(e.target.value)} 
-        style={{ display: 'block', width: '95%', marginBottom: '20px', padding: '10px', marginTop: '5px' }} 
-      />
+      {tab === "capture" ? (
+        <div className="screen-container">
+          <div className="form-card">
+            <label className="label">Activity (WBS)</label>
+            <select
+              value={selectedTaskId}
+              onChange={(e) => {
+                setSelectedTaskId(e.target.value);
+                const t = tasks.find((x) => x.id === parseInt(e.target.value));
+                if (t) setProgress(t.progress);
+              }}
+            >
+              {tasks.map((t) => (
+                <option key={t.id} value={t.id}>
+                  {t.code} {t.name}
+                </option>
+              ))}
+            </select>
+          </div>
 
-      <label style={{ fontWeight: 'bold' }}>Progress %:</label>
-      <input 
-        value={progress} 
-        onChange={(e) => setProgress(e.target.value)} 
-        type="number" 
-        style={{ display: 'block', width: '95%', marginBottom: '20px', padding: '10px', marginTop: '5px' }} 
-      />
+          <div className="form-card">
+            <div className="slider-header">
+              <span className="label">% Complete</span>
+              <span className="pct-old">was {selectedTask.progress}%</span>
+            </div>
+            <div className="pct-display">{progress}%</div>
+            <input
+              type="range"
+              min="0"
+              max="100"
+              value={progress}
+              onChange={(e) => setProgress(e.target.value)}
+            />
+          </div>
 
-      <label style={{ fontWeight: 'bold' }}>Capture / Upload Media:</label>
-      <input 
-        id="media-upload"
-        type="file" 
-        accept="image/*, audio/*" 
-        onChange={handleFileChange} 
-        style={{ display: 'block', marginBottom: '20px', marginTop: '5px' }} 
-      />
+          <div className="form-card">
+            <div className="row-inputs">
+              <div>
+                <label className="label">Quantity Done</label>
+                <input
+                  type="number"
+                  placeholder="e.g. 12"
+                  value={quantity}
+                  onChange={(e) => setQuantity(e.target.value)}
+                />
+              </div>
+              <div>
+                <label className="label">Unit</label>
+                <input type="text" value={selectedTask.unit || "Units"} disabled />
+              </div>
+            </div>
+          </div>
 
-      <button onClick={saveOfflineMock} style={{ width: '100%', padding: '12px', backgroundColor: '#28a745', color: 'white', border: 'none', borderRadius: '5px', fontSize: '16px', cursor: 'pointer', marginBottom: '30px' }}>
-        Queue Entry
-      </button>
+          <div className="form-card">
+            <label className="label">Site Photo Verification</label>
+            <label className="photo-box">
+              <input
+                type="file"
+                accept="image/*"
+                hidden
+                onChange={(e) => setPhoto(e.target.files[0])}
+              />
+              <span style={{ fontSize: "20px" }}>📷</span>
+              <p>{photo ? photo.name : "Capture / Upload Site Photo"}</p>
+            </label>
+            <p className="geotag-text">↗ Geotag locked — 27.4728°N, 95.0211°E</p>
+          </div>
 
-      <div style={{ padding: '20px', backgroundColor: '#f8f9fa', borderRadius: '8px', border: '1px solid #e9ecef' }}>
-        <p style={{ fontSize: '18px', margin: '0 0 15px 0', fontWeight: 'bold' }}>Sync Queue: {queueCount} items</p>
-        <button 
-          onClick={syncData} 
-          disabled={queueCount === 0} 
-          style={{ width: '100%', padding: '12px', backgroundColor: queueCount === 0 ? '#6c757d' : '#6f42c1', color: 'white', border: 'none', borderRadius: '5px', fontSize: '16px', cursor: queueCount === 0 ? 'not-allowed' : 'pointer' }}>
-          Push to Server
+          <div className="form-card">
+            <label className="label">Voice Remark (Whisper AI)</label>
+            <div className="voice-row">
+              <button
+                type="button"
+                className={`rec-btn ${recording ? "recording" : ""}`}
+                onClick={recording ? stopRecording : startRecording}
+              />
+              <span className="waveform">{recording ? "||||||||||||" : "|||li|l|li||l|"}</span>
+              <span className="timer">
+                0:{recordSeconds < 10 ? `0${recordSeconds}` : recordSeconds}
+              </span>
+            </div>
+            {audioBlob && !recording && (
+              <p className="text-[11px] text-emerald-500 mt-2 font-bold">✓ Audio recorded successfully</p>
+            )}
+          </div>
+
+          <button 
+            className="submit-btn" 
+            onClick={handleSave}
+            style={{ opacity: isSubmitting ? 0.7 : 1 }}
+          >
+            {isSubmitting ? "Syncing..." : "Save Entry"}
+          </button>
+        </div>
+      ) : (
+        <div className="screen-container">
+          <div style={{ color: "#f8fafc", fontSize: "15px", fontWeight: 700 }}>
+            Sync Queue ({queue.length} items)
+          </div>
+          {queue.map((item) => (
+            <div key={item.id} className="queue-card">
+              <div>
+                <p style={{ color: "#ffffff", fontSize: "13px", fontWeight: 700 }}>
+                  {item.code} {item.name}
+                </p>
+                <p style={{ color: "#7b93a8", fontSize: "11px", marginTop: "3px" }}>
+                  {item.progress}% • {item.timestamp}
+                </p>
+              </div>
+              <span className={`q-status ${item.status === "SYNCED" ? "synced" : "queued"}`}>
+                {item.status}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <footer className="tab-bar">
+        <button
+          className={`tab-item ${tab === "capture" ? "active" : ""}`}
+          onClick={() => setTab("capture")}
+        >
+          Capture
         </button>
-      </div>
+        <button
+          className={`tab-item ${tab === "queue" ? "active" : ""}`}
+          onClick={() => setTab("queue")}
+        >
+          Sync Queue
+        </button>
+      </footer>
     </div>
   );
 }
