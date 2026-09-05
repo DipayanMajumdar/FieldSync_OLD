@@ -3,6 +3,7 @@ const multer = require('multer');
 const fs = require('fs');
 const path = require('path');
 const axios = require('axios');
+const FormData = require('form-data');
 const csv = require('csv-parser');
 const db = require('./db');
 
@@ -60,11 +61,15 @@ rt.get('/projects', async (q, rs) => {
     rs.json(d.rows);
 
   } catch (e) {
-    console.error('PROJECTS ERR:', e.message);
+    console.error("PROJECTS ERR FULL:", e);
+    console.error("PROJECTS ERR MESSAGE:", e?.message);
+    console.error("PROJECTS ERR STACK:", e?.stack);
 
     rs.status(500).json({
-      err: 'Failed to fetch projects',
-      message: e.message
+      err: "Failed to fetch projects",
+      message: e?.message || String(e),
+      code: e?.code || null,
+      detail: e?.detail || null
     });
   }
 });
@@ -293,7 +298,7 @@ rt.get('/evidence/:pid', async (q, rs) => {
         activity_name: item.activity_name,
 
         // ---------------------------------------
-        // IMAGE URL
+        // CLEAN IMAGE URL
         // ---------------------------------------
 
         uri:
@@ -415,12 +420,12 @@ rt.post(
         : null;
 
     // -----------------------------------------
-    // FILE PATH
+    // CLEAN FILE URL
     // -----------------------------------------
 
     const u =
       q.file
-        ? path.resolve(q.file.path)
+        ? `/uploads/${q.file.filename}`
         : q.body.u;
 
     try {
@@ -446,26 +451,141 @@ rt.post(
       }
 
       // -----------------------------------------
-      // SEND TO AI WORKER
+      // AI ANALYSIS
       // -----------------------------------------
 
-      const ai = await ax.post(
-        'http://127.0.0.1:8000/analyze',
-        {
-          id: parseInt(id),
-          uri: u,
-          typ: t
+      let aiResult = 'AI analysis completed';
+      let aiConfidence = 90;
+
+      if (q.file) {
+
+        const form = new FormData();
+
+        const isImage =
+          q.file.mimetype &&
+          q.file.mimetype.startsWith('image/');
+
+        const isAudio =
+          q.file.mimetype &&
+          q.file.mimetype.startsWith('audio/');
+
+        // ---------------------------------------
+        // IMAGE
+        // ---------------------------------------
+
+        if (isImage) {
+
+          form.append(
+            'image',
+            fs.createReadStream(q.file.path),
+            {
+              filename: q.file.filename,
+              contentType: q.file.mimetype
+            }
+          );
+
         }
-      );
 
-      const aiResult =
-        ai.data?.sts ||
-        'AI analysis completed';
+        // ---------------------------------------
+        // AUDIO
+        // ---------------------------------------
 
-      const aiConfidence =
-        Number(
-          ai.data?.confidence || 90
-        );
+        else if (isAudio) {
+
+          form.append(
+            'audio',
+            fs.createReadStream(q.file.path),
+            {
+              filename: q.file.filename,
+              contentType: q.file.mimetype
+            }
+          );
+
+        }
+
+        // ---------------------------------------
+        // SEND TO CLOUD AI WORKER
+        // ---------------------------------------
+
+        if (isImage || isAudio) {
+
+          const ai =
+            await ax.post(
+              'https://fieldsync-ai-worker.onrender.com/analyze',
+              form,
+              {
+                headers: form.getHeaders(),
+
+                maxContentLength:
+                  Infinity,
+
+                maxBodyLength:
+                  Infinity
+              }
+            );
+
+          // -------------------------------------
+          // PARSE AI RESPONSE
+          // -------------------------------------
+
+          if (
+            Array.isArray(
+              ai.data?.vision_analysis
+            ) &&
+            ai.data.vision_analysis.length
+          ) {
+
+            aiResult =
+              ai.data.vision_analysis
+                .map((x) => {
+
+                  const name =
+                    x.class_name ||
+                    x.class ||
+                    x.name ||
+                    'object';
+
+                  return `Detected: ${name}`;
+                })
+                .join(', ');
+
+            aiConfidence =
+              Number(
+                ai.data.vision_analysis[0]?.confidence ||
+                90
+              );
+
+          }
+
+          else if (
+            ai.data?.voice_transcript
+          ) {
+
+            const transcript =
+              ai.data.voice_transcript;
+
+            aiResult =
+              transcript?.text ||
+              transcript?.transcript ||
+              'Voice transcription completed';
+
+            aiConfidence =
+              Number(
+                transcript?.confidence ||
+                90
+              );
+
+          }
+
+          else {
+
+            aiResult =
+              'AI analysis completed';
+
+            aiConfidence = 90;
+          }
+        }
+      }
 
       // -----------------------------------------
       // SAVE EVIDENCE
@@ -517,13 +637,18 @@ rt.post(
       // -----------------------------------------
 
       rs.json({
-        st: 'Evidence uploaded successfully',
+        st:
+          'Evidence uploaded successfully',
 
-        db: ev.rows[0],
+        db:
+          ev.rows[0],
 
         ai: {
-          result: aiResult,
-          confidence: aiConfidence
+          result:
+            aiResult,
+
+          confidence:
+            aiConfidence
         },
 
         gps: {
@@ -533,7 +658,7 @@ rt.post(
         },
 
         image_url:
-          `/uploads/${path.basename(u)}`
+          u
       });
 
     } catch (e) {
@@ -544,8 +669,11 @@ rt.post(
       );
 
       rs.status(500).json({
-        err: 'Failed to upload evidence',
-        message: e.message
+        err:
+          'Failed to upload evidence',
+
+        message:
+          e.message
       });
     }
   }
@@ -576,7 +704,9 @@ rt.post('/brg', async (q, rs) => {
     }
 
     const b =
-      Number(t.rows[0].act_qty || 0);
+      Number(
+        t.rows[0].act_qty || 0
+      );
 
     const d =
       Number(pp) - b;
@@ -706,7 +836,8 @@ rt.post('/approve', async (q, rs) => {
 
     if (!Number.isFinite(after)) {
       return rs.status(400).json({
-        err: 'actual_qty must be a valid number'
+        err:
+          'actual_qty must be a valid number'
       });
     }
 
@@ -1686,6 +1817,10 @@ rt.get('/dashboard/:pid', async (q, rs) => {
 
             activity_name:
               item.activity_name,
+
+            // ---------------------------------------
+            // CLEAN IMAGE URL
+            // ---------------------------------------
 
             uri:
               item.uri
